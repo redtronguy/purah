@@ -1,0 +1,128 @@
+# Wolf — TrueNAS SCALE 25.10 custom app  (the NAS host ($NAS_HOST), Intel Arc A770, GPU SHARED, LAN-only, Steam v1)
+#
+# DEPLOY via TrueNAS Apps -> Discover Apps -> (three-dot) Install via YAML -> Add Custom App,
+# OR middleware:  midclt call app.create '{"custom_app":true,"app_name":"wolf",
+#                   "custom_compose_config_string":"<this file>"}'
+# NEVER deploy via raw `docker compose` — that is invisible to the dashboard (keeps it visible in the TrueNAS dashboard).
+#
+# The TrueNAS GUI YAML editor RESERIALIZES on save (strips comments, reorders keys). This file is
+# the off-box source of truth; treat the rendered copy under
+#   /mnt/.ix-apps/app_configs/wolf/versions/<ver>/user_config.yaml  as generated.
+#
+# PIN THE TAG AT DEPLOY: `:stable` is a rolling tag and WILL move. After the first good deploy,
+# resolve it to a digest and pin that:
+#   image: ghcr.io/games-on-whales/wolf:stable@sha256:<digest>
+# As of the 2026-06-16 probe, `:stable` resolved to:
+#   sha256:6d2dc982232cf0dc7893b93ef365cb37d2729112c745e2742ae26f00511c0f73
+# (re-pull at deploy and confirm before pinning — it may have moved.)
+#
+# PREREQS (M1, must be true before this app starts):
+#   - games/wolf + games/steam datasets exist (middleware-created), games/steam chowned 1000:1000.
+#   - uinput-init.sh registered as a TrueNAS POST INIT script: `modprobe uinput`/`uhid` + perms on
+#     /dev/uinput + /dev/uhid. Without the module loaded, gamepad/kbd/mouse input silently dies.
+#     NOTE the boot-order race: this app must NOT hard-depend on those nodes at create time (hence
+#     they are NOT in `devices:`); the POST INIT loads the module, the /dev bind + `c 10:* rmw` expose
+#     it. Both /dev/uinput (10,223) AND /dev/uhid (10,239) DO already exist as static nodes on the NAS host
+#     even before the module loads (probe 2026-06-16) — but the module must be loaded to FUNCTION.
+#   - /dev/dri already shared by Plex + Tdarr (proven); this app mirrors their exact recipe.
+#
+# GPU-SHARE RECIPE (verbatim from the live ix-tdarr-tdarr-1 / ix-plaza-plex-1 inspect):
+#   devices: ["/dev/dri:/dev/dri"]  +  group_add: ["44","107","568"]  (video, render, apps GIDs)
+#   runtime defaults to runc; NO nvidia runtime, NO passthrough — pure /dev/dri device share.
+#   The NVIDIA_* env vars Plex/Tdarr carry are inert image leftovers — intentionally NOT copied here.
+services:
+  wolf:
+    image: ghcr.io/games-on-whales/wolf:stable
+    container_name: wolf
+    network_mode: host                 # Moonlight mDNS discovery + fixed UDP/TCP ports; non-negotiable
+    restart: unless-stopped
+
+    environment:
+      # --- Wolf core ---
+      - WOLF_LOG_LEVEL=INFO            # set DEBUG for first bring-up (M2/M3) to see encoder probe + spawn errors
+      - WOLF_RENDER_NODE=/dev/dri/renderD128   # the single Arc A770 render node on the NAS host (confirmed)
+      # HOST_APPS_STATE_FOLDER MUST be the real HOST path (Wolf hands these paths to the HOST docker
+      # daemon when it bind-mounts child-container state). Because config lives at /mnt/games/wolf
+      # (not /etc/wolf), set it EXPLICITLY — this is the #1 footgun for non-/etc/wolf installs.
+      - HOST_APPS_STATE_FOLDER=/mnt/games/wolf
+      - XDG_RUNTIME_DIR=/tmp/sockets   # pulse/wayland sockets shared into child session containers
+      - WOLF_DOCKER_SOCKET=/var/run/docker.sock
+      - WOLF_DEFAULT_RUN_UID=1000      # game runs as 1000 inside child; games/steam must be 1000:1000
+      - WOLF_DEFAULT_RUN_GID=1000
+      - WOLF_STOP_CONTAINER_ON_EXIT=TRUE   # clean up a hung Steam child when Moonlight disconnects
+      # --- Intel Arc A770 (DG2/Alchemist) encode ---
+      - LIBVA_DRIVER_NAME=iHD          # intel-media-driver (iHD), same backend Plex/Tdarr use here
+      - GST_DEBUG=2                    # GStreamer warnings; raise to 3 if chasing an encoder fault
+
+    # GPU share — EXACTLY the Tdarr/Plex pattern on this host (do not deviate):
+    # ONLY /dev/dri is a static `devices:` entry. A compose `devices:` entry whose host path is
+    # absent is a HARD container-create failure ("no such file or directory") — NOT a soft warning.
+    # uinput/uhid are deliberately NOT listed here: they are misc-major-10 nodes whose MODULE is only
+    # loaded by the POST INIT script, and on a the NAS host reboot this app (restart: unless-stopped +
+    # autostart) can start BEFORE that POST INIT runs. Listing them statically would race the boot and
+    # could keep Wolf from ever coming up. Instead Wolf sees them through the broad `/dev:/dev:rw`
+    # bind below + the `c 10:* rmw` cgroup allow — the documented upstream pattern for runtime nodes.
+    devices:
+      - /dev/dri:/dev/dri             # card0 + renderD128 (Arc A770) — shared, no passthrough
+    group_add:
+      - "44"                          # video  (GID 44 on the NAS host)
+      - "107"                         # render (GID 107 on the NAS host)
+      - "568"                         # apps   (GID 568 on the NAS host)
+    device_cgroup_rules:
+      - 'c 10:* rmw'                  # char-major 10 = misc => /dev/uinput (10,223) + /dev/uhid (10,239).
+                                      #   REQUIRED: without it the cgroup controller DENIES open() on
+                                      #   uinput/uhid (EPERM) and virtual input silently dies, since
+                                      #   they are exposed via the /dev bind, not a static devices: entry.
+      - 'c 13:* rmw'                  # char-major 13 = /dev/input/* (the virtual pads uinput creates)
+      - 'c 226:* rmw'                 # char-major 226 = DRM /dev/dri (robust DRI node access; verified e2=226)
+
+    volumes:
+      # CRITICAL (M2, 2026-06-17): the state folder MUST bind-mount at the SAME path inside and out.
+      # Wolf derives its config dir from HOST_APPS_STATE_FOLDER (=/mnt/games/wolf) and writes to
+      # /mnt/games/wolf/cfg/{config.toml,key.pem,cert.pem} INSIDE the container — AND hands host paths
+      # to the docker socket for child containers. With the earlier `:/etc/wolf` mount, Wolf's config
+      # landed on the container's EPHEMERAL fs (verified: host /mnt/games/wolf had no cfg/), so identity
+      # + pairings were lost on every recreate. Identical-path mount makes the writes persist.
+      - /mnt/games/wolf:/mnt/games/wolf                # config/cert/pairings persist at /mnt/games/wolf/cfg/
+      - /var/run/docker.sock:/var/run/docker.sock:rw   # Wolf spawns each Steam session as a SIBLING container
+      - /dev/:/dev/:rw                                 # broad /dev bind — exposes uinput/uhid + hotplugged virtual pads (static devices: list can't)
+      - /run/udev:/run/udev:rw                         # host udev DB for device enumeration + fake-udev hotplug into children
+      - /tmp/sockets:/tmp/sockets:rw                   # pulse/wayland sockets (XDG_RUNTIME_DIR)
+      # NOTE: /mnt/games/steam is deliberately NOT mounted into the Wolf CONTROLLER. The Steam library
+      # reaches the Steam CHILD container via that child's own mounts in config.toml — Wolf passes the
+      # SOURCE path to the HOST docker daemon, which resolves /mnt/games/steam directly off the host FS.
+      # Re-mounting it into Wolf would be inert (Wolf itself never reads the library).
+
+    # Bound the Wolf CONTROLLER container. NOTE: this does NOT bound the game — the game runs in a
+    # SEPARATE sibling container Wolf spawns; its limits live in config.toml base_create_json
+    # (HostConfig.NanoCpus / HostConfig.Memory). BOTH caps are required to protect ZFS ARC and the
+    # democratic-csi iSCSI target on app_storage_2 that backs k8s/database. 3700X = 16 threads;
+    # leave headroom for the NAS. Tune at M5 under real concurrent Plex+Tdarr load.
+    deploy:
+      resources:
+        limits:
+          cpus: '12.0'
+          memory: 20G
+
+    healthcheck:
+      # CORRECTED at M2 deploy (2026-06-17): the wolf `:stable` image ships ONLY /usr/bin/sh — NO grep,
+      # cat, curl, or wget (verified live: `docker exec wolf command -v ...`). The original CMD-SHELL grep
+      # probe failed two ways: grep isn't in the image, AND the hex was wrong (47989 = 0xBB75, not 0xBB55
+      # — 0xBB55 = 47957, a port nothing binds). Both pegged the container permanently `unhealthy` →
+      # TrueNAS app stuck DEPLOYING despite Wolf being fully up.
+      # Fix: a pure-sh script staged on the games/wolf volume (-> /etc/wolf/healthcheck.sh) that scans
+      # /proc/net/tcp{,6} for a LISTEN (st 0A) socket on any Moonlight TCP port (47984/47989/48010 =
+      # BB70/BB75/BB8A). No external binary. Tested exit 0 against the live container before applying.
+      # The script is in this repo at scripts/healthcheck.sh and MUST be staged at /mnt/games/wolf/.
+      test: ["CMD", "sh", "/mnt/games/wolf/healthcheck.sh"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 90s               # first boot auto-generates config.toml + key/cert; allow time
+
+# NOTE: the Steam SESSION container is launched BY Wolf via docker.sock from the [[profiles.apps]]
+# entry in /mnt/games/wolf/config.toml (image ghcr.io/games-on-whales/steam:edge). It is NOT a
+# TrueNAS app and will NOT appear in the Apps list — only this `wolf` controller does. The game's
+# GPU/uinput/library mounts AND its cpu/mem caps are declared in config.toml, not here.
+# With network_mode: host the `ports:` block is intentionally omitted — Wolf binds directly on
+# the NAS host: 47984/tcp 47989/tcp 47999/udp 48010/tcp 48100/udp 48200/udp. Keep LAN-only (no WAN, no tunnel).

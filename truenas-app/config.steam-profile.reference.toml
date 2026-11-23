@@ -1,0 +1,136 @@
+# config.steam-profile.reference.toml — the NAS host (Intel Arc A770), Steam-only, LAN, v1
+# #############################################################################
+# ##  THIS IS AN EDIT REFERENCE, NOT A DEPLOYABLE FILE.                       ##
+# ##  NEVER copy this to /mnt/games/wolf/config.toml.                         ##
+# ##  Doing so CLOBBERS the config Wolf auto-generates on first boot — incl.  ##
+# ##  the auto-written key.pem/cert.pem references and the default profile id ##
+# ##  — and references key/cert files that don't exist yet, so Wolf fails.    ##
+# ##  Let Wolf generate /mnt/games/wolf/config.toml first, THEN hand-edit     ##
+# ##  THAT file to match the Steam profile + encoder order shown below.       ##
+# ##  M1 staging copies ONLY uinput-init.sh + 85-wolf-virtual-inputs.rules    ##
+# ##  to /mnt/games/wolf — never this file.                                   ##
+# #############################################################################
+# =============================================================================
+# Wolf AUTO-GENERATES the real config.toml on first boot (config_version = 7) with a FULL app
+# catalog (Wolf UI, Firefox, RetroArch, Steam, Pegasus, Lutris, Prismlauncher, XFCE, ES-DE, Kodi)
+# AND its own paired_clients / key paths. You EDIT the generated file in place rather than write it
+# from scratch. This reference shows what the Steam profile and the Arc encoder blocks MUST look
+# like after you trim the generated file for v1.
+#
+# WORKFLOW (M3):
+#   1. Let Wolf boot once and generate /mnt/games/wolf/config.toml. NEVER pre-place a config.toml —
+#      it would clobber the auto-generated key/cert references and the default profile id. (This
+#      reference file is named config.steam-profile.reference.toml precisely so it can't be loaded.)
+#   2. Stop the wolf app. Edit the GENERATED config.toml (not this file):
+#        - DELETE every [[profiles.apps]] block except Steam (and optionally keep the Wolf UI).
+#        - REPLACE the Steam [[profiles.apps]] block with the one below (adds the games/steam
+#          library mount + the cpu/mem caps in base_create_json that protect the NAS/iSCSI).
+#        - REORDER the encoder lists so the Arc LOW-POWER (lp) VA elements are FIRST (see bottom).
+#   3. Start the wolf app. Confirm in logs: "Selected HEVC encoder: va" / "Selected H264 encoder: va".
+#      If it logs "qsv", the encoder order is wrong — fix it (qsv glitches/greys on this Arc).
+#
+# DO NOT hand-write paired_clients / key.pem / cert.pem — those are Wolf-managed (PIN pairing flow).
+# Losing /mnt/games/wolf = re-pair every Moonlight client + re-login Steam. Back it up (M5).
+# =============================================================================
+
+hostname = "Purah"            # name shown in Moonlight discovery on the LAN
+config_version = 7
+# paired_clients = []              # Wolf fills this as clients complete the PIN pairing flow — leave it.
+
+# -----------------------------------------------------------------------------
+# Profile: the default app list shown to paired Moonlight clients. For v1 this holds ONE app: Steam.
+# -----------------------------------------------------------------------------
+[[profiles]]
+id = "moonlight-profile-id"        # keep Wolf's auto-generated id; this is just illustrative
+
+  # ---------------------------------------------------------------------------
+  # Steam — the session container Wolf spawns (gamescope/Sway + Steam Big Picture).
+  # This is the upstream config.v7.toml Steam runner WITH three host-specific additions (NOT verbatim
+  # upstream):
+  #   - games/steam library mount
+  #   - GOW_REQUIRED_DEVICES extended with /dev/uinput /dev/uhid for virtual input. The GOW entrypoint
+  #     GLOBS this list against the host /dev, so a missing node (e.g. if uhid never materialized)
+  #     simply matches nothing — harmless. /dev/input/* is what actually carries the virtual pads.
+  #   - base_create_json NanoCpus + Memory caps (the ONLY place a game-level limit takes effect)
+  # ---------------------------------------------------------------------------
+  [[profiles.apps]]
+  title = "Steam"
+  icon_png_path = "https://games-on-whales.github.io/wildlife/apps/steam/assets/icon.png"
+  start_virtual_compositor = true  # Wolf allocates a Wayland virtual display for the Steam session
+
+    [profiles.apps.runner]
+    type = "docker"
+    name = "WolfSteam"
+    image = "ghcr.io/games-on-whales/steam:edge"   # GOW rolling app tag; pin its digest after first good run
+    devices = []
+    ports = []
+    mounts = [
+        # Steam library on the games NVMe pool. Lands at the in-container steamapps dir.
+        # games/steam MUST be chown 1000:1000 (perms 777 per upstream) so the in-container user can write.
+        "/mnt/games/steam:/home/retro/.steam/debian-installation/steamapps:rw",
+    ]
+    env = [
+        "PROTON_LOG=1",
+        "RUN_SWAY=true",                 # Steam runs under Sway inside Wolf's virtual compositor
+        # /dev/dri/* binds the Arc A770 into the Steam child (SAME GPU share as Plex/Tdarr, no passthrough).
+        # /dev/uinput + /dev/uhid + /dev/input/* give the session virtual keyboard/mouse/gamepad.
+        # /dev/nvidia* is harmless here (no NVIDIA on the NAS host — matches nothing).
+        "GOW_REQUIRED_DEVICES=/dev/uinput /dev/uhid /dev/input/* /dev/dri/* /dev/nvidia*",
+        # Optional: launch straight into Big Picture (recommended for couch/Moonlight UX):
+        # "STEAM_STARTUP_FLAGS=-bigpicture",
+        # Optional: launch one specific game by appid:
+        # "STEAM_STARTUP_FLAGS=steam://rungameid/<appid>",
+    ]
+    # Raw docker-create JSON merged into the child container. Proton/Wine need the caps + unconfined
+    # seccomp/apparmor. The Ulimit + IpcMode=host are upstream defaults.
+    # *** NanoCpus + Memory are the GAME's resource cap — this is the iSCSI guard. ***
+    #   NanoCpus 12000000000 = 12.0 CPUs   |   Memory 21474836480 = 20 GiB
+    # Keep the game's cap aligned with (and not exceeding) the Wolf controller's deploy limit so the
+    # two containers together never starve ZFS ARC / the democratic-csi iSCSI target on app_storage_2.
+    base_create_json = """
+{
+  "HostConfig": {
+    "IpcMode": "host",
+    "CapAdd": ["SYS_ADMIN", "SYS_NICE", "SYS_PTRACE", "NET_RAW", "MKNOD", "NET_ADMIN"],
+    "SecurityOpt": ["seccomp=unconfined", "apparmor=unconfined"],
+    "Ulimits": [{"Name": "nofile", "Hard": 10240, "Soft": 10240}],
+    "Privileged": false,
+    "DeviceCgroupRules": ["c 13:* rmw", "c 226:* rmw", "c 244:* rmw"],
+    "NanoCpus": 12000000000,
+    "Memory": 21474836480
+  }
+}
+"""
+
+# =============================================================================
+# GStreamer ENCODER ORDER — Intel Arc A770 (DG2/Alchemist)
+# =============================================================================
+# Wolf auto-generates [gstreamer.video.*_encoders] lists and picks the FIRST encoder GStreamer can
+# init, per codec. Default order is nvcodec -> va -> qsv -> va-lp -> SW. On the NAS host (no NVIDIA) it
+# lands on `va`. For Arc A-series you MUST prefer the LOW-POWER (lp) variants and AVOID qsv:
+#
+#   - HEVC (PRIMARY for LAN): move  vah265lpenc  to the TOP of the hevc_encoders list.
+#   - H264 (fallback for older clients): move  vah264lpenc  above  vah264enc.
+#   - AV1 (opt-in only): vaav1lpenc — Arc AV1 is the most unstable path; COMMENT OUT the av1_encoders
+#     blocks entirely if AV1 streaming misbehaves (stuck ~30fps / encode failures).
+#   - DELETE or demote ALL qsv* blocks (qsvh265enc/qsvh264enc/qsvav1enc) — they trigger the
+#     MFX_ERR_UNSUPPORTED firmware-sensitivity class and glitch/grey on this Arc; `va` is superior here.
+#
+# KNOWN ARC BUG — vapostproc segfault/bus-error on DG2 (intel media-driver #1800): the va/qsv
+# pipelines route raw video through `vapostproc` and can segfault or pin at ~30fps on A750/A770.
+# If the stream is grey/corrupt or stuck at 30fps, edit the selected encoder's video_params to
+# replace `vapostproc` with software `videoconvert` (loses zero-copy, gains stability), e.g.:
+#
+#   [gstreamer.video.defaults.va]
+#   # zero-copy (try FIRST — #103 reporter got HEVC ~85fps / H264 ~50fps with this):
+#   video_params = "videoconvert ! queue ! vapostproc ! video/x-raw(memory:VAMemory),format=NV12"
+#   # stability fallback if vapostproc segfaults on this Arc:
+#   # video_params = "videoconvert ! queue ! video/x-raw,format=NV12"
+#
+# Verify selection in Wolf logs after start:
+#   "Selected HEVC encoder: va"   "Selected H264 encoder: va"   (any "qsv" => fix the order)
+#
+# Codec priority for Moonlight LAN v1:  HEVC primary  ->  H264 fallback  ->  AV1 opt-in only.
+# (These encoder blocks are large and auto-generated; reorder them in the generated file rather
+#  than pasting full pipelines here — the rule is: lp-first, va-over-qsv, vapostproc->videoconvert
+#  only if the stream breaks.)

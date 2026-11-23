@@ -1,0 +1,37 @@
+# Purah (Wolf) — universal compose, parameterized per host via an env file (see env/EXAMPLE.env).
+services:
+  wolf:
+    image: ghcr.io/games-on-whales/wolf:stable
+    container_name: wolf
+    network_mode: host
+    restart: unless-stopped
+    environment:
+      - WOLF_LOG_LEVEL=INFO
+      - WOLF_RENDER_NODE=${RENDER_NODE}
+      - LIBVA_DRIVER_NAME=${LIBVA_DRIVER}
+      - HOST_APPS_STATE_FOLDER=${WOLF_STATE}
+      - XDG_RUNTIME_DIR=/tmp/sockets
+      - WOLF_DOCKER_SOCKET=/var/run/docker.sock
+      - WOLF_DEFAULT_RUN_UID=1000
+      - WOLF_DEFAULT_RUN_GID=1000
+      - WOLF_STOP_CONTAINER_ON_EXIT=TRUE
+      - GST_DEBUG=2
+    devices:
+      - /dev/dri:/dev/dri
+    group_add: ["${VIDEO_GID}", "${RENDER_GID}", "${INPUT_GID}"]
+    device_cgroup_rules:
+      - 'c 10:* rmw'
+      - 'c 13:* rmw'
+      - 'c 226:* rmw'
+    volumes:
+      - ${WOLF_STATE}:${WOLF_STATE}
+      - /var/run/docker.sock:/var/run/docker.sock:rw
+      - /dev/:/dev/:rw
+      - /run/udev:/run/udev:rw
+      - /tmp/sockets:/tmp/sockets:rw
+    healthcheck:
+      test: ["CMD", "sh", "${WOLF_STATE}/healthcheck.sh"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 90s

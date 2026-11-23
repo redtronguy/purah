@@ -1,0 +1,18 @@
+# 85-wolf-virtual-inputs.rules — Wolf virtual input device perms/seat (canonical upstream content).
+#
+# MASTER COPY lives on the games data pool at /mnt/games/wolf/85-wolf-virtual-inputs.rules.
+# uinput-init.sh (POST INIT) reinstalls it into /etc/udev/rules.d on every boot, because a
+# TrueNAS OS upgrade reimages the root FS and wipes /etc/udev/rules.d. Do NOT treat the /etc copy
+# as the source of truth.
+#
+# Grants the 'input' group access to /dev/uinput + /dev/uhid and tags Wolf's virtual pads to seat9.
+# NOTE: OPTIONS+="static_node=uinput" pre-creates the /dev/uinput node, but the kernel MODULE still
+# must be loaded (modprobe uinput in uinput-init.sh) for the node to actually function.
+
+KERNEL=="uinput", SUBSYSTEM=="misc", MODE="0660", GROUP="input", OPTIONS+="static_node=uinput", TAG+="uaccess"
+KERNEL=="uhid", GROUP="input", MODE="0660", TAG+="uaccess"
+KERNEL=="hidraw*", ATTRS{name}=="Wolf PS5 (virtual) pad", GROUP="root", MODE="0660", ENV{ID_SEAT}="seat9"
+SUBSYSTEMS=="input", ATTRS{name}=="Wolf X-Box One (virtual) pad", GROUP="root", MODE="0660", ENV{ID_SEAT}="seat9"
+SUBSYSTEMS=="input", ATTRS{name}=="Wolf PS5 (virtual) pad", GROUP="root", MODE="0660", ENV{ID_SEAT}="seat9"
+SUBSYSTEMS=="input", ATTRS{name}=="Wolf gamepad (virtual) motion sensors", GROUP="root", MODE="0660", ENV{ID_SEAT}="seat9"
+SUBSYSTEMS=="input", ATTRS{name}=="Wolf Nintendo (virtual) pad", GROUP="root", MODE="0660", ENV{ID_SEAT}="seat9"
